@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from datetime import datetime
 import uvicorn
 import os
+import json
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -33,8 +34,8 @@ class SentimentRequest(BaseModel):
     text: str
 
 class SentimentResponse(BaseModel):
-    sentiment: str  # "positive" | "negative" | "neutral"
-    confidence: float  # 0.0 to 1.0
+    sentiment: str   # "positive" | "negative" | "neutral"
+    confidence: float
     explanation: str
 
 @app.get("/health", response_model=HealthResponse)
@@ -44,29 +45,14 @@ async def health():
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
-# === Summarize with 3 Prompt Variations (from STEP 4) ===
+# === Summarize function (unchanged from before) ===
 def summarize_with_prompt(text: str, max_length: int, version: int = 2) -> str:
     if version == 1:
-        prompt = f"""Summarize the following text in {max_length} words or less. 
-Be concise and capture the main points only.
-
-Text: {text}
-
-Summary:"""
+        prompt = f"""Summarize the following text in {max_length} words or less. Be concise and capture the main points only.\n\nText: {text}\n\nSummary:"""
     elif version == 2:
-        prompt = f"""You are an expert summarizer. Create a clear, professional summary of the text below. 
-Limit the summary to approximately {max_length} words. Focus on key ideas and remove fluff.
-
-Text: {text}
-
-Summary:"""
-    elif version == 3:
-        prompt = f"""Provide a high-quality, coherent summary of this text in no more than {max_length} words. 
-Make it readable and natural. Prioritize the most important information.
-
-Text: {text}
-
-Summary:"""
+        prompt = f"""You are an expert summarizer. Create a clear, professional summary of the text below. Limit to approximately {max_length} words. Focus on key ideas.\n\nText: {text}\n\nSummary:"""
+    else:
+        prompt = f"""Provide a high-quality, coherent summary of this text in no more than {max_length} words. Make it readable and natural.\n\nText: {text}\n\nSummary:"""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -80,36 +66,77 @@ Summary:"""
 async def summarize(request: SummarizeRequest):
     if not request.text or len(request.text.strip()) == 0:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
-    
     summary = summarize_with_prompt(request.text, request.max_length, version=2)
     return {"summary": summary}
 
-# === Basic Sentiment Analysis (placeholder - will be improved in STEP 6) ===
+# === FIXED: 3 Prompt Variations for Sentiment Analysis ===
+def analyze_sentiment_with_prompt(text: str, version: int = 2) -> dict:
+    base_instructions = """You are a precise sentiment analysis expert.
+Return ONLY a valid JSON object with these exact keys:
+- "sentiment": one of "positive", "negative", or "neutral"
+- "confidence": a float number between 0.0 and 1.0
+- "explanation": a short clear reason (max 120 characters)
+
+Do not add any extra text, explanation, or markdown outside the JSON."""
+
+    if version == 1:
+        prompt = f"""{base_instructions}
+
+Text: {text}
+
+JSON:"""
+    elif version == 2:
+        prompt = f"""{base_instructions}
+
+Analyze the emotional tone carefully and be objective.
+
+Text: {text}
+
+JSON:"""
+    else:  # version 3 - strongest
+        prompt = f"""{base_instructions}
+
+Be very accurate with confidence score.
+
+Text: {text}
+
+JSON:"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=250,
+            temperature=0.1,
+            response_format={"type": "json_object"}   # This forces JSON output
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        
+        # Parse JSON safely
+        result = json.loads(result_text)
+        
+        return {
+            "sentiment": str(result.get("sentiment", "neutral")).lower(),
+            "confidence": float(result.get("confidence", 0.5)),
+            "explanation": str(result.get("explanation", "No explanation provided."))
+        }
+        
+    except Exception as e:
+        # Robust fallback
+        return {
+            "sentiment": "neutral",
+            "confidence": 0.5,
+            "explanation": f"Parsing error occurred. Raw response: {str(e)[:80]}"
+        }
+
 @app.post("/analyze-sentiment", response_model=SentimentResponse)
 async def analyze_sentiment(request: SentimentRequest):
     if not request.text or len(request.text.strip()) == 0:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     
-    # Basic placeholder logic (will be replaced with LLM in next step)
-    text_lower = request.text.lower()
-    if any(word in text_lower for word in ["good", "great", "excellent", "happy", "love", "amazing"]):
-        sentiment = "positive"
-        confidence = 0.75
-        explanation = "Detected positive keywords in the text."
-    elif any(word in text_lower for word in ["bad", "terrible", "awful", "sad", "hate", "worst"]):
-        sentiment = "negative"
-        confidence = 0.70
-        explanation = "Detected negative keywords in the text."
-    else:
-        sentiment = "neutral"
-        confidence = 0.60
-        explanation = "No strong positive or negative keywords detected."
-    
-    return {
-        "sentiment": sentiment,
-        "confidence": confidence,
-        "explanation": explanation
-    }
+    result = analyze_sentiment_with_prompt(request.text, version=2)
+    return result
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
